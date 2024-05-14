@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Fuse 1000 RGB-D images from the 7-scenes dataset into a TSDF voxel volume with 2cm resolution.
 """
 

@@ -16,7 +16,7 @@ except Exception as err:
   FUSION_GPU_MODE = 0
 
 
-class TSDFVolume:
+class OcclusionVolume:
   """Volumetric TSDF Fusion of RGB-D Images.
   """
   def __init__(self, vol_bnds, voxel_size, use_gpu=True):
@@ -116,9 +116,9 @@ class TSDFVolume:
           // Integrate TSDF
           float trunc_margin = other_params[4];
           float depth_diff = depth_value-cam_pt_z;
-          if (depth_diff < -trunc_margin)
+          if (depth_diff < 0)//-trunc_margin)
               return;
-          float dist = fmin(0.5f,depth_diff/trunc_margin);
+          float dist = fmin(-1.0f,depth_diff/trunc_margin);
           float w_old = weight_vol[voxel_idx];
           float obs_weight = other_params[5];
           float w_new = w_old + obs_weight;
@@ -266,8 +266,8 @@ class TSDFVolume:
 
       # Integrate TSDF
       depth_diff = depth_val - pix_z
-      valid_pts = np.logical_and(depth_val > 0, depth_diff >= -self._trunc_margin)
-      dist = np.minimum(.5, depth_diff / self._trunc_margin)
+      valid_pts = np.logical_and(depth_val > 0, depth_diff >= 0)#-self._trunc_margin)
+      dist = np.minimum(-1, depth_diff / self._trunc_margin)
       valid_vox_x = self.vox_coords[valid_pts, 0]
       valid_vox_y = self.vox_coords[valid_pts, 1]
       valid_vox_z = self.vox_coords[valid_pts, 2]
@@ -304,8 +304,7 @@ class TSDFVolume:
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts = measure.marching_cubes(tsdf_vol, mask=np.logical_and(tsdf_vol > -0.5,tsdf_vol < 0.5), level=0)[0]
-    # verts = measure.marching_cubes(tsdf_vol, level=0)[0]
+    verts = measure.marching_cubes(tsdf_vol, level=0)[0]
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size + self._vol_origin
 
@@ -326,7 +325,7 @@ class TSDFVolume:
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=np.logical_and(tsdf_vol > -0.8,tsdf_vol < 0.8), level=0)
+    verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, level=0)
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates
 
