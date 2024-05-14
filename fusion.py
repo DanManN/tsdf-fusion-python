@@ -51,6 +51,7 @@ class TSDFVolume:
     # for computing the cumulative moving average of observations per voxel
     self._weight_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
     self._color_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+    self._mask_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
 
     self.gpu_mode = use_gpu and FUSION_GPU_MODE
 
@@ -62,19 +63,23 @@ class TSDFVolume:
       cuda.memcpy_htod(self._weight_vol_gpu,self._weight_vol_cpu)
       self._color_vol_gpu = cuda.mem_alloc(self._color_vol_cpu.nbytes)
       cuda.memcpy_htod(self._color_vol_gpu,self._color_vol_cpu)
+      self._mask_vol_gpu = cuda.mem_alloc(self._mask_vol_cpu.nbytes)
+      cuda.memcpy_htod(self._mask_vol_gpu,self._mask_vol_cpu)
 
       # Cuda kernel function (C++)
       self._cuda_src_mod = SourceModule("""
         __global__ void integrate(float * tsdf_vol,
                                   float * weight_vol,
                                   float * color_vol,
+                                  float * mask_vol,
                                   float * vol_dim,
                                   float * vol_origin,
                                   float * cam_intr,
                                   float * cam_pose,
                                   float * other_params,
                                   float * color_im,
-                                  float * depth_im) {
+                                  float * depth_im,
+                                  float * mask_im) {
           // Get voxel index
           int gpu_loop_idx = (int) other_params[0];
           int max_threads_per_block = blockDim.x;
@@ -137,6 +142,10 @@ class TSDFVolume:
           new_g = fmin(roundf((old_g*w_old+obs_weight*new_g)/w_new),255.0f);
           new_r = fmin(roundf((old_r*w_old+obs_weight*new_r)/w_new),255.0f);
           color_vol[voxel_idx] = new_b*256*256+new_g*256+new_r;
+          // Integrate mask
+          float old_mask = mask_vol[voxel_idx];
+          float new_mask = mask_im[pixel_y*im_w+pixel_x];
+          mask_vol[voxel_idx] = (old_mask + new_mask)/2;
         }""")
 
       self._cuda_integrate = self._cuda_src_mod.get_function("integrate")
@@ -204,12 +213,13 @@ class TSDFVolume:
       tsdf_vol_int[i] = (w_old[i] * tsdf_vol[i] + obs_weight * dist[i]) / w_new[i]
     return tsdf_vol_int, w_new
 
-  def integrate(self, color_im, depth_im, cam_intr, cam_pose, obs_weight=1.):
+  def integrate(self, color_im, depth_im, mask_im, cam_intr, cam_pose, obs_weight=1.):
     """Integrate an RGB-D frame into the TSDF volume.
 
     Args:
       color_im (ndarray): An RGB image of shape (H, W, 3).
       depth_im (ndarray): A depth image of shape (H, W).
+      mask_im  (ndarray): A binary mask of shape (H, W).
       cam_intr (ndarray): The camera intrinsics matrix of shape (3, 3).
       cam_pose (ndarray): The camera pose (i.e. extrinsics) of shape (4, 4).
       obs_weight (float): The weight to assign for the current observation. A higher
@@ -226,6 +236,7 @@ class TSDFVolume:
         self._cuda_integrate(self._tsdf_vol_gpu,
                             self._weight_vol_gpu,
                             self._color_vol_gpu,
+                            self._mask_vol_gpu,
                             cuda.InOut(self._vol_dim.astype(np.float32)),
                             cuda.InOut(self._vol_origin.astype(np.float32)),
                             cuda.InOut(cam_intr.reshape(-1).astype(np.float32)),
@@ -240,6 +251,7 @@ class TSDFVolume:
                             ], np.float32)),
                             cuda.InOut(color_im.reshape(-1).astype(np.float32)),
                             cuda.InOut(depth_im.reshape(-1).astype(np.float32)),
+                            cuda.InOut(mask_im.reshape(-1).astype(np.float32)),
                             block=(self._max_gpu_threads_per_block,1,1),
                             grid=(
                               int(self._max_gpu_grid_dim[0]),
@@ -292,16 +304,22 @@ class TSDFVolume:
       new_r = np.minimum(255., np.round((w_old*old_r + obs_weight*new_r) / w_new))
       self._color_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = new_b*self._color_const + new_g*256 + new_r
 
+      # Integrate mask
+      old_mask = self._mask_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
+      new_mask = mask_im[pix_y[valid_pts], pix_x[valid_pts]]
+      self._mask_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = np.logical_or(old_mask, new_mask)
+
   def get_volume(self):
     if self.gpu_mode:
       cuda.memcpy_dtoh(self._tsdf_vol_cpu, self._tsdf_vol_gpu)
       cuda.memcpy_dtoh(self._color_vol_cpu, self._color_vol_gpu)
-    return self._tsdf_vol_cpu, self._color_vol_cpu
+      cuda.memcpy_dtoh(self._mask_vol_cpu, self._mask_vol_gpu)
+    return self._tsdf_vol_cpu, self._color_vol_cpu, self._mask_vol_cpu
 
   def get_point_cloud(self):
     """Extract a point cloud from the voxel volume.
     """
-    tsdf_vol, color_vol = self.get_volume()
+    tsdf_vol, color_vol, mask_vol = self.get_volume()
 
     # Marching cubes
     verts = measure.marching_cubes(tsdf_vol, mask=np.logical_and(tsdf_vol > -0.5,tsdf_vol < 0.5), level=0)[0]
@@ -317,13 +335,16 @@ class TSDFVolume:
     colors = np.floor(np.asarray([colors_r, colors_g, colors_b])).T
     colors = colors.astype(np.uint8)
 
-    pc = np.hstack([verts, colors])
+    # Get mask
+    mask = mask_vol[verts_ind[:, 0], verts_ind[:, 1], verts_ind[:, 2]].reshape((-1, 1))
+
+    pc = np.hstack([verts, colors, mask])
     return pc
 
   def get_mesh(self):
     """Compute a mesh from the voxel volume using marching cubes.
     """
-    tsdf_vol, color_vol = self.get_volume()
+    tsdf_vol, color_vol, mask_vol = self.get_volume()
 
     # Marching cubes
     verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=np.logical_and(tsdf_vol > -0.8,tsdf_vol < 0.8), level=0)
@@ -403,7 +424,7 @@ def pcwrite(filename, xyzrgb):
   """Save a point cloud to a polygon .ply file.
   """
   xyz = xyzrgb[:, :3]
-  rgb = xyzrgb[:, 3:].astype(np.uint8)
+  rgb = xyzrgb[:, 3:6].astype(np.uint8)
 
   # Write header
   ply_file = open(filename,'w')
