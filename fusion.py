@@ -145,7 +145,7 @@ class TSDFVolume:
           // Integrate mask
           float old_mask = mask_vol[voxel_idx];
           float new_mask = mask_im[pixel_y*im_w+pixel_x];
-          mask_vol[voxel_idx] = (old_mask + new_mask)/2;
+          mask_vol[voxel_idx] = old_mask + new_mask;
         }""")
 
       self._cuda_integrate = self._cuda_src_mod.get_function("integrate")
@@ -307,7 +307,7 @@ class TSDFVolume:
       # Integrate mask
       old_mask = self._mask_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
       new_mask = mask_im[pix_y[valid_pts], pix_x[valid_pts]]
-      self._mask_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = np.logical_or(old_mask, new_mask)
+      self._mask_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = old_mask + new_mask
 
   def get_volume(self):
     if self.gpu_mode:
