@@ -52,6 +52,7 @@ class TSDFVolume:
     self._weight_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
     self._color_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
     self._mask_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+    self._seen_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
 
     self.gpu_mode = use_gpu and FUSION_GPU_MODE
 
@@ -65,6 +66,8 @@ class TSDFVolume:
       cuda.memcpy_htod(self._color_vol_gpu,self._color_vol_cpu)
       self._mask_vol_gpu = cuda.mem_alloc(self._mask_vol_cpu.nbytes)
       cuda.memcpy_htod(self._mask_vol_gpu,self._mask_vol_cpu)
+      self._seen_vol_gpu = cuda.mem_alloc(self._seen_vol_cpu.nbytes)
+      cuda.memcpy_htod(self._seen_vol_gpu,self._seen_vol_cpu)
 
       # Cuda kernel function (C++)
       self._cuda_src_mod = SourceModule("""
@@ -72,6 +75,7 @@ class TSDFVolume:
                                   float * weight_vol,
                                   float * color_vol,
                                   float * mask_vol,
+                                  float * seen_vol,
                                   float * vol_dim,
                                   float * vol_origin,
                                   float * cam_intr,
@@ -146,6 +150,7 @@ class TSDFVolume:
           float old_mask = mask_vol[voxel_idx];
           float new_mask = mask_im[pixel_y*im_w+pixel_x];
           mask_vol[voxel_idx] = old_mask + new_mask;
+          seen_vol[voxel_idx]++; //Adding times seen
         }""")
 
       self._cuda_integrate = self._cuda_src_mod.get_function("integrate")
@@ -237,6 +242,7 @@ class TSDFVolume:
                             self._weight_vol_gpu,
                             self._color_vol_gpu,
                             self._mask_vol_gpu,
+                            self._seen_vol_gpu,
                             cuda.InOut(self._vol_dim.astype(np.float32)),
                             cuda.InOut(self._vol_origin.astype(np.float32)),
                             cuda.InOut(cam_intr.reshape(-1).astype(np.float32)),
@@ -308,18 +314,20 @@ class TSDFVolume:
       old_mask = self._mask_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
       new_mask = mask_im[pix_y[valid_pts], pix_x[valid_pts]]
       self._mask_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = old_mask + new_mask
+      self._seen_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] += 1
 
   def get_volume(self):
     if self.gpu_mode:
       cuda.memcpy_dtoh(self._tsdf_vol_cpu, self._tsdf_vol_gpu)
       cuda.memcpy_dtoh(self._color_vol_cpu, self._color_vol_gpu)
       cuda.memcpy_dtoh(self._mask_vol_cpu, self._mask_vol_gpu)
-    return self._tsdf_vol_cpu, self._color_vol_cpu, self._mask_vol_cpu
+      cuda.memcpy_dtoh(self._seen_vol_cpu, self._seen_vol_gpu)
+    return self._tsdf_vol_cpu, self._color_vol_cpu, self._mask_vol_cpu, self._seen_vol_cpu
 
   def get_point_cloud(self):
     """Extract a point cloud from the voxel volume.
     """
-    tsdf_vol, color_vol, mask_vol = self.get_volume()
+    tsdf_vol, color_vol, mask_vol, seen_vol = self.get_volume()
 
     # Marching cubes
     verts = measure.marching_cubes(tsdf_vol, mask=np.logical_and(tsdf_vol > -0.5,tsdf_vol < 0.5), level=0)[0]
@@ -337,14 +345,15 @@ class TSDFVolume:
 
     # Get mask
     mask = mask_vol[verts_ind[:, 0], verts_ind[:, 1], verts_ind[:, 2]].reshape((-1, 1))
+    seen = seen_vol[verts_ind[:, 0], verts_ind[:, 1], verts_ind[:, 2]].reshape((-1, 1))
 
-    pc = np.hstack([verts, colors, mask])
+    pc = np.hstack([verts, colors, mask, seen])
     return pc
 
   def get_mesh(self):
     """Compute a mesh from the voxel volume using marching cubes.
     """
-    tsdf_vol, color_vol, mask_vol = self.get_volume()
+    tsdf_vol, color_vol, mask_vol, seen_vol = self.get_volume()
 
     # Marching cubes
     verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=np.logical_and(tsdf_vol > -0.8,tsdf_vol < 0.8), level=0)
