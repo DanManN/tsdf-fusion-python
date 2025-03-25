@@ -47,7 +47,8 @@ class TSDFVolume:
     )
 
     # Initialize pointers to voxel volume in CPU memory
-    self._tsdf_vol_cpu = -100*np.ones(self._vol_dim).astype(np.float32)
+    self._tsdf_vol_cpu = np.ones(self._vol_dim).astype(np.float32)
+    self._occl_vol_cpu = -100*np.ones(self._vol_dim).astype(np.float32)
     # for computing the cumulative moving average of observations per voxel
     self._weight_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
     self._color_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
@@ -60,6 +61,8 @@ class TSDFVolume:
     if self.gpu_mode:
       self._tsdf_vol_gpu = cuda.mem_alloc(self._tsdf_vol_cpu.nbytes)
       cuda.memcpy_htod(self._tsdf_vol_gpu,self._tsdf_vol_cpu)
+      self._occl_vol_gpu = cuda.mem_alloc(self._occl_vol_cpu.nbytes)
+      cuda.memcpy_htod(self._occl_vol_gpu,self._occl_vol_cpu)
       self._weight_vol_gpu = cuda.mem_alloc(self._weight_vol_cpu.nbytes)
       cuda.memcpy_htod(self._weight_vol_gpu,self._weight_vol_cpu)
       self._color_vol_gpu = cuda.mem_alloc(self._color_vol_cpu.nbytes)
@@ -72,6 +75,7 @@ class TSDFVolume:
       # Cuda kernel function (C++)
       self._cuda_src_mod = SourceModule("""
         __global__ void integrate(float * tsdf_vol,
+                                  float * occl_vol,
                                   float * weight_vol,
                                   float * color_vol,
                                   float * mask_vol,
@@ -122,17 +126,18 @@ class TSDFVolume:
           float depth_value = depth_im[pixel_y*im_w+pixel_x];
           if (depth_value == 0)
               return;
-          // Integrate TSDF
+          // Integrate TSDF and Occlusion
           float trunc_margin = other_params[4];
           float depth_diff = depth_value-cam_pt_z;
-
-          float dist = depth_diff;///trunc_margin;
+          occl_vol[voxel_idx] = fmax(occl_vol[voxel_idx],depth_diff);
+          if (depth_diff < -trunc_margin)
+              return;
+          float dist = fmin(1.0f,depth_diff/trunc_margin);
           float w_old = weight_vol[voxel_idx];
           float obs_weight = other_params[5];
           float w_new = w_old + obs_weight;
           weight_vol[voxel_idx] = w_new;
-          //tsdf_vol[voxel_idx] = (tsdf_vol[voxel_idx]*w_old+obs_weight*dist)/w_new;
-          tsdf_vol[voxel_idx] = fmax(tsdf_vol[voxel_idx],dist);
+          tsdf_vol[voxel_idx] = (tsdf_vol[voxel_idx]*w_old+obs_weight*dist)/w_new;
           // Integrate color
           if (depth_diff < -trunc_margin)
               return;
@@ -210,16 +215,17 @@ class TSDFVolume:
 
   @staticmethod
   @njit(parallel=True)
-  def integrate_tsdf(tsdf_vol, dist, w_old, obs_weight):
+  def integrate_tsdf(tsdf_vol, occl_vol, dist, w_old, obs_weight):
     """Integrate the TSDF volume.
     """
     tsdf_vol_int = np.empty_like(tsdf_vol, dtype=np.float32)
+    occl_vol_int = np.empty_like(occl_vol, dtype=np.float32)
     # w_new = np.empty_like(w_old, dtype=np.float32)
     for i in prange(len(tsdf_vol)):
-      # w_new[i] = w_old[i] + obs_weight
-      # tsdf_vol_int[i] = (w_old[i] * tsdf_vol[i] + obs_weight * dist[i]) / w_new[i]
-      tsdf_vol_int[i] = max(tsdf_vol[i], dist[i])
-    return tsdf_vol_int, w_new
+      w_new[i] = w_old[i] + obs_weight
+      tsdf_vol_int[i] = (w_old[i] * tsdf_vol[i] + obs_weight * dist[i]) / w_new[i]
+      occl_vol_int[i] = max(occl_vol[i], dist[i])
+    return tsdf_vol_int, w_new, occl_vol_int
 
   def integrate(self, color_im, depth_im, mask_im, cam_intr, cam_pose, obs_weight=1.):
     """Integrate an RGB-D frame into the TSDF volume.
@@ -242,6 +248,7 @@ class TSDFVolume:
     if self.gpu_mode:  # GPU mode: integrate voxel volume (calls CUDA kernel)
       for gpu_loop_idx in range(self._n_gpu_loops):
         self._cuda_integrate(self._tsdf_vol_gpu,
+                            self._occl_vol_gpu,
                             self._weight_vol_gpu,
                             self._color_vol_gpu,
                             self._mask_vol_gpu,
@@ -290,16 +297,18 @@ class TSDFVolume:
       # valid_pts = np.logical_and(depth_val > 0, depth_diff >= -self._trunc_margin)
       # dist = np.minimum(.5, depth_diff / self._trunc_margin)
       valid_pts = (depth_val != 0)
-      dist = depth_diff #/ self._trunc_margin
+      dist = depth_diff / self._trunc_margin
       valid_vox_x = self.vox_coords[valid_pts, 0]
       valid_vox_y = self.vox_coords[valid_pts, 1]
       valid_vox_z = self.vox_coords[valid_pts, 2]
       w_old = self._weight_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
       tsdf_vals = self._tsdf_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
+      occl_vals = self._occl_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
       valid_dist = dist[valid_pts]
-      tsdf_vol_new, w_new = self.integrate_tsdf(tsdf_vals, valid_dist, w_old, obs_weight)
+      tsdf_vol_new, w_new, occl_vol_new = self.integrate_tsdf(tsdf_vals, occl_vals, valid_dist, w_old, obs_weight)
       self._weight_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = w_new
       self._tsdf_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = tsdf_vol_new
+      self._occl_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = occl_vol_new
 
       # Integrate color
       old_color = self._color_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
@@ -324,18 +333,19 @@ class TSDFVolume:
   def get_volume(self):
     if self.gpu_mode:
       cuda.memcpy_dtoh(self._tsdf_vol_cpu, self._tsdf_vol_gpu)
+      cuda.memcpy_dtoh(self._occl_vol_cpu, self._occl_vol_gpu)
       cuda.memcpy_dtoh(self._color_vol_cpu, self._color_vol_gpu)
       cuda.memcpy_dtoh(self._mask_vol_cpu, self._mask_vol_gpu)
       cuda.memcpy_dtoh(self._seen_vol_cpu, self._seen_vol_gpu)
-    return self._tsdf_vol_cpu, self._color_vol_cpu, self._mask_vol_cpu, self._seen_vol_cpu
+    return self._tsdf_vol_cpu, self._occl_vol_cpu, self._color_vol_cpu, self._mask_vol_cpu, self._seen_vol_cpu
 
   def get_point_cloud(self):
     """Extract a point cloud from the voxel volume.
     """
-    tsdf_vol, color_vol, mask_vol, seen_vol = self.get_volume()
+    tsdf_vol, occl_vol, color_vol, mask_vol, seen_vol = self.get_volume()
 
     # Marching cubes
-    verts = measure.marching_cubes(tsdf_vol, mask=(tsdf_vol > -0.01) & (tsdf_vol < 0.005), level=0)[0]
+    verts = measure.marching_cubes(tsdf_vol, mask=(tsdf_vol > -0.5) & (tsdf_vol < 0.9), level=0)[0]
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size + self._vol_origin
 
@@ -357,10 +367,10 @@ class TSDFVolume:
   def get_mesh(self):
     """Compute a mesh from the voxel volume using marching cubes.
     """
-    tsdf_vol, color_vol, mask_vol, seen_vol = self.get_volume()
+    tsdf_vol, occl_vol, color_vol, mask_vol, seen_vol = self.get_volume()
 
     # Marching cubes
-    verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=(tsdf_vol > -0.01) & (tsdf_vol < 0.01), level=0)
+    verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=(tsdf_vol > -0.5) & (tsdf_vol < 0.5), level=0)
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates
 
