@@ -4,6 +4,7 @@ import numpy as np
 
 from numba import njit, prange
 from skimage import measure
+import torch
 
 try:
   import pycuda.driver as cuda
@@ -349,6 +350,97 @@ class TSDFVolume:
 
     pc = np.hstack([verts, colors, mask, seen])
     return pc
+
+  def get_downsampled_point_cloud(self):
+      """Extract a downsampled point cloud from the voxel volume."""
+      
+      # Get voxel volumes
+      tsdf_vol, color_vol, mask_vol, seen_vol = self.get_volume()
+
+      # Downsample using strided slicing (consistent with free space mask)
+      reduce = 2
+      tsdf_vol = tsdf_vol[::reduce, ::reduce, ::reduce]
+      color_vol = color_vol[::reduce, ::reduce, ::reduce]
+      mask_vol = mask_vol[::reduce, ::reduce, ::reduce]
+      seen_vol = seen_vol[::reduce, ::reduce, ::reduce]
+
+      # Adjust voxel size to maintain proper scaling
+      downsampled_voxel_size = self._voxel_size * 2  
+
+      # Run Marching Cubes on downsampled TSDF
+      verts = measure.marching_cubes(tsdf_vol, mask=(tsdf_vol > -0.5) & (tsdf_vol < 0.9), level=0)[0]
+      verts_ind = np.round(verts).astype(int)
+      verts = verts * downsampled_voxel_size + self._vol_origin
+
+      # Get vertex colors (Ensure indices stay valid after downsampling)
+      valid_indices = (verts_ind[:, 0] < color_vol.shape[0]) & \
+                      (verts_ind[:, 1] < color_vol.shape[1]) & \
+                      (verts_ind[:, 2] < color_vol.shape[2])
+      
+      verts = verts[valid_indices]
+      verts_ind = verts_ind[valid_indices]
+      
+      rgb_vals = color_vol[verts_ind[:, 0], verts_ind[:, 1], verts_ind[:, 2]]
+      colors_b = np.floor(rgb_vals / self._color_const)
+      colors_g = np.floor((rgb_vals - colors_b * self._color_const) / 256)
+      colors_r = rgb_vals - colors_b * self._color_const - colors_g * 256
+      colors = np.floor(np.asarray([colors_r, colors_g, colors_b])).T.astype(np.uint8)
+
+      # Get mask and seen values (Apply valid index mask)
+      mask = mask_vol[verts_ind[:, 0], verts_ind[:, 1], verts_ind[:, 2]].reshape((-1, 1))
+      seen = seen_vol[verts_ind[:, 0], verts_ind[:, 1], verts_ind[:, 2]].reshape((-1, 1))
+
+      # Concatenate everything into the point cloud
+      pc = np.hstack([verts, colors, mask, seen])
+      return pc
+
+  def get_downsampled_all_voxels_pcd_and_voxel_mask(self, reduce=10):
+      """Downsampled pcd from every voxel imagining that each are points"""
+
+      # Get the voxel grid data
+      tsdf_vol, color_vol, mask_vol, seen_vol = self.get_volume()
+
+      # Downsample everything using strided slicing
+      tsdf_vol = tsdf_vol[::reduce, ::reduce, ::reduce]
+      color_vol = color_vol[::reduce, ::reduce, ::reduce]
+      mask_vol = mask_vol[::reduce, ::reduce, ::reduce]
+      seen_vol = seen_vol[::reduce, ::reduce, ::reduce]
+
+      # Adjust voxel size for proper scaling
+      downsampled_voxel_size = self._voxel_size * reduce 
+
+      # Generate voxel grid coordinates, so this is just an evenly spaced 3d box
+      x, y, z = np.meshgrid(
+          np.arange(tsdf_vol.shape[0]),
+          np.arange(tsdf_vol.shape[1]),
+          np.arange(tsdf_vol.shape[2]),
+          indexing='ij'  # Ensures correct (x, y, z) order
+      )
+
+      # Flatten into lists of coordinates, [xyz, points].T
+      points = np.vstack((x.ravel(), y.ravel(), z.ravel())).T
+      #Now the grid of points needs to be scaled down to how far voxels are from each other and add the world origin
+      points = points * downsampled_voxel_size + self._vol_origin  # Scale to world coordinates
+
+      # Filter only voxels that are free space (mask_vol == 1)
+      # valid_mask = mask_vol.ravel() == 1
+      # points = points[valid_mask]
+      occupied_mask = ((tsdf_vol > -0.5) & (tsdf_vol < 0.9)).ravel()
+
+      pc = points #np.hstack([points, colors, seen])
+
+      occupied_mask = torch.from_numpy(occupied_mask).to(torch.bool)
+      return pc, occupied_mask
+
+  def get_downsampled_all_voxels_pcd(self, reduce=10):
+    #Returns [points, 3]
+    pc, _ = self.get_downsampled_all_voxels_pcd_and_voxel_mask(reduce)
+    return pc
+
+  def get_downsampled_voxel_collision_mask(self, reduce=10):
+    #Return [points, 1] bool
+    _, occupied_mask = self.get_downsampled_all_voxels_pcd_and_voxel_mask(reduce)
+    return occupied_mask
 
   def get_mesh(self):
     """Compute a mesh from the voxel volume using marching cubes.
