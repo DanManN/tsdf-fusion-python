@@ -34,6 +34,7 @@ class TSDFVolume:
     self._vol_bnds = vol_bnds
     self._voxel_size = float(voxel_size)
     self._trunc_margin = 5 * self._voxel_size  # truncation on SDF
+    print("trunc margin", self._trunc_margin)
     self._color_const = 256 * 256
 
     # Adjust volume bounds and ensure C-order contiguous
@@ -365,12 +366,30 @@ class TSDFVolume:
     return pc
 
   def get_downsampled_all_voxels_pcd_and_voxel_mask(self, reduce=10):
-      """Downsampled pcd from every voxel imagining that each are points"""
+      """
+      To find which voxels the transition overlaps, they want this grid of where the points on the downsampled point cloud are
+      So they downsample the point cloud, create a grid from the sizes, and creates points in a certain order
+
+      For the real query of the point cloud, the input is the tsdf volume raveled.
+
+      Possible issues:
+      {
+      The position offset of the point cloud is off
+      The downsampled voxel distance between points is off
+      } Print both clouds
+
+      {
+      The order of the points is off
+      } See when indexing the point cloud about the real point cloud shows a matching version
+      """
 
       # Get the voxel grid data
       tsdf_vol, occl_vol, color_vol, mask_vol, seen_vol = self.get_volume()
 
       # Downsample everything using strided slicing
+      #(occl_vol > -100) & (occl_vol < 0)
+      occupied_mask = ((occl_vol > -100) & (occl_vol < 0)) #Points that are closer to 0 than -0.7 and points that are closer to 0 than 0.99
+      occupied_mask = occupied_mask | ((tsdf_vol > -0.5) & (tsdf_vol < 0.9))
       tsdf_vol = tsdf_vol[::reduce, ::reduce, ::reduce]
       color_vol = color_vol[::reduce, ::reduce, ::reduce]
       mask_vol = mask_vol[::reduce, ::reduce, ::reduce]
@@ -395,7 +414,8 @@ class TSDFVolume:
       # Filter only voxels that are free space (mask_vol == 1)
       # valid_mask = mask_vol.ravel() == 1
       # points = points[valid_mask]
-      occupied_mask = ((tsdf_vol > -0.5) & (tsdf_vol < 0.9)).ravel()
+      #occupied_mask = ((tsdf_vol > -0.5) & (tsdf_vol < 0.9)).ravel()
+      occupied_mask = occupied_mask[::reduce, ::reduce, ::reduce].ravel()
 
       pc = points #np.hstack([points, colors, seen])
 
