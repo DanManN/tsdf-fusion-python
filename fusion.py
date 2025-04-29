@@ -85,6 +85,8 @@ class TSDFVolume:
                                   float * vol_origin,
                                   float * cam_intr,
                                   float * cam_pose,
+                                  float * rgb_intr,
+                                  float * rgb_pose,
                                   float * other_params,
                                   float * color_im,
                                   float * depth_im,
@@ -139,9 +141,21 @@ class TSDFVolume:
           float w_new = w_old + obs_weight;
           weight_vol[voxel_idx] = w_new;
           tsdf_vol[voxel_idx] = (tsdf_vol[voxel_idx]*w_old+obs_weight*dist)/w_new;
-          // Integrate color
           if (depth_diff < -trunc_margin)
               return;
+          // World coordinates to rgb camera coordinates
+          tmp_pt_x = pt_x-rgb_pose[0*4+3];
+          tmp_pt_y = pt_y-rgb_pose[1*4+3];
+          tmp_pt_z = pt_z-rgb_pose[2*4+3];
+          float rgb_pt_x = rgb_pose[0*4+0]*tmp_pt_x+rgb_pose[1*4+0]*tmp_pt_y+rgb_pose[2*4+0]*tmp_pt_z;
+          float rgb_pt_y = rgb_pose[0*4+1]*tmp_pt_x+rgb_pose[1*4+1]*tmp_pt_y+rgb_pose[2*4+1]*tmp_pt_z;
+          float rgb_pt_z = rgb_pose[0*4+2]*tmp_pt_x+rgb_pose[1*4+2]*tmp_pt_y+rgb_pose[2*4+2]*tmp_pt_z;
+          // Camera coordinates to image pixels
+          pixel_x = (int) roundf(rgb_intr[0*3+0]*(rgb_pt_x/rgb_pt_z)+rgb_intr[0*3+2]);
+          pixel_y = (int) roundf(rgb_intr[1*3+1]*(rgb_pt_y/rgb_pt_z)+rgb_intr[1*3+2]);
+          if (pixel_x < 0 || pixel_x >= im_w || pixel_y < 0 || pixel_y >= im_h || cam_pt_z<0)
+              return;
+          // Integrate color
           float old_color = color_vol[voxel_idx];
           float old_b = floorf(old_color/(256*256));
           float old_g = floorf((old_color-old_b*256*256)/256);
@@ -228,7 +242,7 @@ class TSDFVolume:
       occl_vol_int[i] = max(occl_vol[i], dist[i])
     return tsdf_vol_int, w_new, occl_vol_int
 
-  def integrate(self, color_im, depth_im, mask_im, cam_intr, cam_pose, obs_weight=1.):
+  def integrate(self, color_im, depth_im, mask_im, cam_intr, cam_pose, rgb_intr, rgb_pose, obs_weight=1.):
     """Integrate an RGB-D frame into the TSDF volume.
 
     Args:
@@ -237,6 +251,8 @@ class TSDFVolume:
       mask_im  (ndarray): A binary mask of shape (H, W).
       cam_intr (ndarray): The camera intrinsics matrix of shape (3, 3).
       cam_pose (ndarray): The camera pose (i.e. extrinsics) of shape (4, 4).
+      rgb_intr (ndarray): The RGB camera intrinsics matrix of shape (3, 3).
+      rgb_pose (ndarray): The RGB camera pose (i.e. extrinsics) of shape (4, 4).
       obs_weight (float): The weight to assign for the current observation. A higher
         value
     """
@@ -258,6 +274,8 @@ class TSDFVolume:
                             cuda.InOut(self._vol_origin.astype(np.float32)),
                             cuda.InOut(cam_intr.reshape(-1).astype(np.float32)),
                             cuda.InOut(cam_pose.reshape(-1).astype(np.float32)),
+                            cuda.InOut(rgb_intr.reshape(-1).astype(np.float32)),
+                            cuda.InOut(rgb_pose.reshape(-1).astype(np.float32)),
                             cuda.InOut(np.asarray([
                               gpu_loop_idx,
                               self._voxel_size,
@@ -310,6 +328,13 @@ class TSDFVolume:
       self._weight_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = w_new
       self._tsdf_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = tsdf_vol_new
       self._occl_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = occl_vol_new
+
+      # get pixels map for rgb image
+      rgb_pts = self.vox2world(self._vol_origin, self.vox_coords, self._voxel_size)
+      rgb_pts = rigid_transform(rgb_pts, np.linalg.inv(rgb_pose))
+      # pix_z = rgb_pts[:, 2]
+      pix = self.cam2pix(rgb_pts, rgb_intr)
+      pix_x, pix_y = pix[:, 0], pix[:, 1]
 
       # Integrate color
       old_color = self._color_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
