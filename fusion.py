@@ -19,6 +19,22 @@ except Exception as err:
 class TSDFVolume:
   """Volumetric TSDF Fusion of RGB-D Images.
   """
+  def reset_visible(self):
+    # self._tsdf_vol_cpu[:] = 1.0
+    # self._occl_vol_cpu = -100*np.ones(self._vol_dim).astype(np.float32)
+    self._weight_vol_cpu[:] = 0.0
+    # self._color_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+    self._mask_vol_cpu[:] = 0.0
+
+    # Copy voxel volumes to GPU
+    if self.gpu_mode:
+      # cuda.memcpy_htod(self._tsdf_vol_gpu,self._tsdf_vol_cpu)
+      # cuda.memcpy_htod(self._occl_vol_gpu,self._occl_vol_cpu)
+      cuda.memcpy_htod(self._weight_vol_gpu,self._weight_vol_cpu)
+      # cuda.memcpy_htod(self._color_vol_gpu,self._color_vol_cpu)
+      cuda.memcpy_htod(self._mask_vol_gpu,self._mask_vol_cpu)
+
+
   def __init__(self, vol_bnds, voxel_size, use_gpu=True):
     """Constructor.
 
